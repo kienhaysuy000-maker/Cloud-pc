@@ -64,6 +64,9 @@ jobs:
             Write-Host "OS: $($os.Caption) | Version: $($os.Version) | Arch: $($os.OSArchitecture)"
             Write-Host "CPU: $($cpu.Name) | $($cpu.NumberOfCores) cores / $($cpu.NumberOfLogicalProcessors) threads"
             Write-Host "RAM: $ram GB"
+            if ($cpu.NumberOfLogicalProcessors -lt 4) {
+              Write-Warning "Máy chỉ có $($cpu.NumberOfLogicalProcessors) luồng CPU (thiếu 4 vCPU). Repo private chỉ có 2 vCPU; dùng repo public."
+            }
             if ($ram -lt 15) {
               Write-Warning "RAM dưới 16GB: repo private chỉ có 2 vCPU/8GB. Dùng repo public để có 4 vCPU/16GB."
             }
@@ -340,78 +343,84 @@ jobs:
           }
 
           netsh int tcp set global autotuninglevel=normal | Out-Null
+          netsh int tcp set global rss=enabled | Out-Null
 
-          # Dọn temp cho rộng ổ đĩa (chỉ 14 GB)
-          Remove-Item "$env:TEMP\*" -Recurse -Force -ErrorAction SilentlyContinue
-          Get-PSDrive C | ForEach-Object { Write-Host ("Ổ C còn trống: {0} GB" -f [math]::Round($_.Free / 1GB, 1)) }
-
-      - name: 6. Thông tin kết nối
-        shell: pwsh
-        run: |
-          $ip = $env:TS_IP
-          if (-not $ip) {
-            $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
-            $ip = (& $ts ip -4 2>$null | ForEach-Object {
-              $m = [regex]::Match($_, '100\.\d{1,3}\.\d{1,3}\.\d{1,3}')
-              if ($m.Success) { $m.Value }
-            } | Select-Object -First 1)
-          }
-          if (-not $ip) { throw "Không lấy được Tailscale IP." }
-
-          $discordStatus = $env:DISCORD_STATUS
-          if (-not $discordStatus) { $discordStatus = "xem log step 4" }
-          $os = (Get-CimInstance Win32_OperatingSystem).Caption
-
-          $text = @(
-            "## RDP sẵn sàng",
-            "- Windows: $os",
-            "- Runner: ${{ inputs.runner }}",
-            "- Host: $ip",
-            "- Port: 3389",
-            "- User: $env:RDP_USER",
-            "- Password: secret RDP_PASSWORD",
-            "- Discord: $discordStatus",
-            "- Thời gian: ${{ inputs.minutes }} phút"
-          ) -join "`n"
-          Add-Content $env:GITHUB_STEP_SUMMARY $text
-          Write-Host $text
-
-      - name: 7. Giữ máy
-        shell: pwsh
-        timeout-minutes: ${{ fromJSON(inputs.minutes) }}
-        run: |
-          $end = (Get-Date).AddMinutes([int]"${{ inputs.minutes }}")
-          Write-Host "RDP sống đến $($end.ToString('HH:mm:ss'))."
-          while ((Get-Date) -lt $end) {
-            Start-Sleep -Seconds 60
-            # Tự phục hồi nếu RDP/Tailscale bị tắt
+          function Set-Reg([string]$Path, [string]$Name, $Value, [string]$Type = "DWord") {
             try {
-              if (-not (Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue)) {
-                Write-Warning "RDP rớt, khởi động lại TermService..."
-                Restart-Service TermService -Force -ErrorAction SilentlyContinue
-              }
-              $t = Get-Service | Where-Object { $_.Name -match 'Tailscale' } | Select-Object -First 1
-              if ($t -and $t.Status -ne "Running") { Start-Service $t.Name -ErrorAction SilentlyContinue }
-            } catch { }
+              if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
+              Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type $Type -ErrorAction Stop
+            } catch { Write-Warning "Reg $Path\$Name lỗi: $($_.Exception.Message)" }
           }
 
-      - name: 8. Debug khi lỗi
-        if: failure()
-        shell: pwsh
-        run: |
-          Write-Host "User: $([Security.Principal.WindowsIdentity]::GetCurrent().Name)"
-          Get-Service TermService, Tailscale -ErrorAction SilentlyContinue | Format-Table Name, Status, StartType
-          Get-NetTCPConnection -LocalPort 3389 -ErrorAction SilentlyContinue | Format-Table LocalAddress, LocalPort, State
-          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          if (Test-Path $ts) {
-            & $ts version 2>&1 | ForEach-Object { Write-Host $_ }
-            & $ts status 2>&1 | ForEach-Object { Write-Host $_ }
-            & $ts ip -4 2>&1 | ForEach-Object { Write-Host $_ }
+          # --- RDP mượt hơn: 60 FPS, dùng cả UDP, nén H.264 AVC444 ---
+          $wsTcp = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations"
+          Set-Reg $wsTcp "DWMFRAMEINTERVAL" 15
+          $tsPol = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+          Set-Reg $tsPol "SelectTransport" 0
+          Set-Reg $tsPol "fClientDisableUDP" 0
+          Set-Reg $tsPol "AVC444ModePreferred" 1
+          Set-Reg $tsPol "VisualExperiencePolicy" 1
+          Set-Reg $tsPol "ColorDepth" 5
+          Set-Reg $tsPol "fResetBroken" 0
+          Set-Reg $tsPol "fDisableWallpaper" 1
+
+          # --- Không khoá màn hình / không tắt phiên khi rảnh ---
+          Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization" "NoLockScreen" 1
+          Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" "InactivityTimeoutSecs" 0
+          Set-Reg "HKCU:\Control Panel\Desktop" "ScreenSaveActive" "0" "String"
+          Set-Reg "HKCU:\Control Panel\Desktop" "ScreenSaverIsSecure" "0" "String"
+          powercfg /setacvalueindex SCHEME_CURRENT SUB_NONE CONSOLELOCK 0 2>$null
+          powercfg /setactive SCHEME_CURRENT
+
+          # --- Âm thanh: bật Windows Audio cho app cần loa ---
+          foreach ($s in @("Audiosrv", "AudioEndpointBuilder")) {
+            Set-Service $s -StartupType Automatic -ErrorAction SilentlyContinue
+            Start-Service $s -ErrorAction SilentlyContinue
           }
-          Get-ChildItem "$env:ProgramData\Tailscale" -Filter *.log -Recurse -ErrorAction SilentlyContinue |
-            Select-Object -First 3 |
-            ForEach-Object {
-              Write-Host "----- $($_.FullName) -----"
-              Get-Content $_.FullName -Tail 60 -ErrorAction SilentlyContinue
-            }
-            
+
+          # --- Tắt service/tác vụ nền tốn CPU, mạng, ổ đĩa ---
+          foreach ($s in @("wuauserv", "UsoSvc", "DoSvc", "WaaSMedicSvc", "BITS", "WerSvc", "diagnosticshub.standardcollector.service", "MapsBroker", "RetailDemo", "XblAuthManager", "XblGameSave", "XboxNetApiSvc", "XboxGipSvc")) {
+            Stop-Service $s -Force -ErrorAction SilentlyContinue
+            Set-Service $s -StartupType Disabled -ErrorAction SilentlyContinue
+          }
+          $tasks = @(
+            "\Microsoft\Windows\Defrag\ScheduledDefrag",
+            "\Microsoft\Windows\Windows Defender\Windows Defender Scheduled Scan",
+            "\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser",
+            "\Microsoft\Windows\Customer Experience Improvement Program\Consolidator",
+            "\Microsoft\Windows\UpdateOrchestrator\Schedule Scan",
+            "\Microsoft\Windows\Diagnosis\Scheduled",
+            "\Microsoft\Windows\Maintenance\WinSAT"
+          )
+          foreach ($t in $tasks) { schtasks /Change /TN $t /Disable 2>$null | Out-Null }
+
+          # --- Defender: tắt thêm các lớp quét nặng ---
+          try {
+            Set-MpPreference -DisableBehaviorMonitoring $true -DisableIOAVProtection $true `
+              -DisableScriptScanning $true -DisableArchiveScanning $true -MAPSReporting 0 `
+              -SubmitSamplesConsent 2 -ErrorAction Stop
+          } catch { Write-Warning "Defender (lớp phụ): $($_.Exception.Message)" }
+
+          # --- Giao diện: bỏ widget, chat, tin tức, gợi ý để nhẹ hơn ---
+          $adv = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+          Set-Reg $adv "TaskbarAl" 0
+          Set-Reg $adv "TaskbarDa" 0
+          Set-Reg $adv "TaskbarMn" 0
+          Set-Reg $adv "ShowTaskViewButton" 0
+          Set-Reg $adv "HideFileExt" 0
+          Set-Reg $adv "Hidden" 1
+          Set-Reg "HKCU:\Software\Microsoft\Windows\CurrentVersion\Search" "SearchboxTaskbarMode" 0
+          Set-Reg "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-338388Enabled" 0
+          Set-Reg "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SilentInstalledAppsEnabled" 0
+          Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" "AllowNewsAndInterests" 0
+          Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot" "TurnOffWindowsCopilot" 1
+
+          # --- Hiệu năng hệ thống: ưu tiên app đang dùng, giảm độ trễ game/app ---
+          Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl" "Win32PrioritySeparation" 38
+          Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" "SystemResponsiveness" 0
+          Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" "NetworkThrottlingIndex" 4294967295
+          Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR" "AllowGameDVR" 0
+          Set-Reg "HKCU:\System\GameConfigStore" "GameDVR_Enabled" 0
+          Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management" "DisablePagingExecutive" 1
+          Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" "NtfsDisableLastAccessUpdate" 1
+  
