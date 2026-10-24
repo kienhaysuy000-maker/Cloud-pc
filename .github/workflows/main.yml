@@ -429,4 +429,4 @@ jobs:
           Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot" "TurnOffWindowsCopilot" 1
 
           # --- Hiệu năng hệ thống: ưu tiên app đang dùng, giảm độ trễ game/app ---
-          Set-Reg "HKLM:\SYSTEM\Curr
+          Set-Reg "HKLM:\SYSTEM\Currcurl.exe
