@@ -32,13 +32,25 @@ on:
           - "120"
           - "240"
           - "330"
+      auto_renew:
+        description: "Tự bật máy mới trước khi hết giờ để chạy liên tục (nối tiếp nhiều lượt 6 giờ)"
+        required: true
+        default: true
+        type: boolean
+      renew_from:
+        description: "Workflow tự điền khi nối lượt, KHÔNG điền tay"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
+  actions: write   # cần để workflow tự gọi lại chính nó (auto_renew)
 
 # Mỗi lần chạy chỉ 1 máy: chạy mới sẽ huỷ máy cũ
+# Lượt tự nối (renew_from có giá trị) dùng group riêng để KHÔNG huỷ máy cũ khi máy mới đang khởi động
 concurrency:
-  group: windows-rdp
+  group: ${{ inputs.renew_from != '' && format('windows-rdp-{0}', github.run_id) || 'windows-rdp' }}
   cancel-in-progress: true
 
 jobs:
@@ -55,6 +67,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Continue"
+          Add-Content -Path $env:GITHUB_ENV -Value "JOB_START=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
           Write-Host "Runner label: ${{ inputs.runner }}"
           try {
             $os  = Get-CimInstance Win32_OperatingSystem
@@ -416,11 +429,4 @@ jobs:
           Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot" "TurnOffWindowsCopilot" 1
 
           # --- Hiệu năng hệ thống: ưu tiên app đang dùng, giảm độ trễ game/app ---
-          Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl" "Win32PrioritySeparation" 38
-          Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" "SystemResponsiveness" 0
-          Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" "NetworkThrottlingIndex" 4294967295
-          Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR" "AllowGameDVR" 0
-          Set-Reg "HKCU:\System\GameConfigStore" "GameDVR_Enabled" 0
-          Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management" "DisablePagingExecutive" 1
-          Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" "NtfsDisableLastAccessUpdate" 1
-  
+          Set-Reg "HKLM:\SYSTEM\Curr
