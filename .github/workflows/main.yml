@@ -1,45 +1,49 @@
-# GitHub Actions Windows RDP
-# Secrets: RDP_PASSWORD, TAILSCALE_AUTHKEY
+# GitHub Actions Windows RDP (Tailscale) - chọn Windows Server 2022 hoặc Windows 11
+# Secrets cần có: RDP_PASSWORD, TAILSCALE_AUTHKEY
 # Lưu thành .github/workflows/rdp.yml trên default branch
 #
-# GitHub-hosted Windows (public repo): 4 vCPU / 16 GB RAM / 14 GB SSD.
-# - windows-2022    : Windows Server 2022 x64 (khuyên dùng, app tương thích tốt nhất)
-# - windows-11-arm  : Windows 11 Enterprise ARM64 (đúng Win11, nhưng app x86 chạy giả lập)
-# Không có Windows 11 x64 miễn phí trên GitHub-hosted runner.
-# Repo private chỉ được 2 vCPU / 8 GB RAM.
-name: Windows RDP Safe
+# Cấu hình free tối đa (repo PUBLIC): 4 vCPU / 16 GB RAM / 14 GB SSD
+# Repo PRIVATE chỉ được 2 vCPU / 8 GB RAM (GitHub giới hạn, không đổi được).
+#
+# Hai lựa chọn:
+# - windows-2022   : Windows Server 2022 x64 (app tương thích tốt nhất)
+# - windows-11-arm : Windows 11 Enterprise ARM64 (Win11 thật, app x86/x64 chạy giả lập)
+# GitHub không có runner Windows 11 x64 miễn phí.
+name: Windows RDP
 
 on:
   workflow_dispatch:
     inputs:
-      minutes:
-        description: "Thời gian giữ máy (phút)"
-        required: true
-        default: "120"
-        type: choice
-        options:
-          - "60"
-          - "120"
-          - "240"
-          - "330"
       runner:
-        description: "windows-2022 = Server 2022 x64; windows-11-arm = Win11 ARM64"
+        description: "Chọn Windows: windows-2022 = Server 2022 x64 | windows-11-arm = Windows 11 ARM64"
         required: true
         default: "windows-2022"
         type: choice
         options:
           - "windows-2022"
           - "windows-11-arm"
+      minutes:
+        description: "Thời gian giữ máy (phút)"
+        required: true
+        default: "330"
+        type: choice
+        options:
+          - "60"
+          - "120"
+          - "240"
+          - "330"
 
 permissions:
   contents: read
 
+# Mỗi lần chạy chỉ 1 máy: chạy mới sẽ huỷ máy cũ
 concurrency:
-  group: windows-rdp-safe
+  group: windows-rdp
   cancel-in-progress: true
 
 jobs:
   rdp:
+    name: RDP ${{ inputs.runner }}
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 360
     env:
@@ -47,21 +51,21 @@ jobs:
       TS_HOST: gh-rdp-${{ github.run_id }}
 
     steps:
-      - name: 1. Kiểm tra
+      - name: 1. Kiểm tra máy
         shell: pwsh
         run: |
           $ErrorActionPreference = "Continue"
           Write-Host "Runner label: ${{ inputs.runner }}"
           try {
-            $os = Get-CimInstance Win32_OperatingSystem
+            $os  = Get-CimInstance Win32_OperatingSystem
             $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
-            $cs = Get-CimInstance Win32_ComputerSystem
+            $cs  = Get-CimInstance Win32_ComputerSystem
             $ram = [math]::Round($cs.TotalPhysicalMemory / 1GB, 1)
             Write-Host "OS: $($os.Caption) | Version: $($os.Version) | Arch: $($os.OSArchitecture)"
             Write-Host "CPU: $($cpu.Name) | $($cpu.NumberOfCores) cores / $($cpu.NumberOfLogicalProcessors) threads"
             Write-Host "RAM: $ram GB"
             if ($ram -lt 15) {
-              Write-Warning "RAM dưới 16GB. Repo private chỉ được 2 vCPU/8GB; dùng repo public để có 4 vCPU/16GB."
+              Write-Warning "RAM dưới 16GB: repo private chỉ có 2 vCPU/8GB. Dùng repo public để có 4 vCPU/16GB."
             }
           } catch {
             Write-Warning "Không đọc được cấu hình máy: $($_.Exception.Message)"
@@ -75,12 +79,8 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-            throw "Thiếu secret RDP_PASSWORD."
-          }
-          if ($env:RDP_PASSWORD.Length -lt 14) {
-            throw "RDP_PASSWORD phải từ 14 ký tự."
-          }
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) { throw "Thiếu secret RDP_PASSWORD." }
+          if ($env:RDP_PASSWORD.Length -lt 14) { throw "RDP_PASSWORD phải từ 14 ký tự." }
           $classes = @(
             ($env:RDP_PASSWORD -cmatch '[A-Z]'),
             ($env:RDP_PASSWORD -cmatch '[a-z]'),
@@ -109,18 +109,16 @@ jobs:
             Write-Warning "Không clear được PasswordExpired: $($_.Exception.Message)"
           }
 
-          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
-            -Name "fDenyTSConnections" -Value 0 -Type DWord
-          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
-            -Name "UserAuthentication" -Value 1 -Type DWord
-          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
-            -Name "MaxIdleTime" -Value 0 -Type DWord
-          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
-            -Name "MaxDisconnectionTime" -Value 0 -Type DWord
+          $ts  = "HKLM:\System\CurrentControlSet\Control\Terminal Server"
+          $tcp = "$ts\WinStations\RDP-Tcp"
+          Set-ItemProperty $ts  -Name "fDenyTSConnections" -Value 0 -Type DWord
+          Set-ItemProperty $tcp -Name "UserAuthentication" -Value 1 -Type DWord
+          Set-ItemProperty $tcp -Name "MaxIdleTime" -Value 0 -Type DWord
+          Set-ItemProperty $tcp -Name "MaxDisconnectionTime" -Value 0 -Type DWord
 
+          # Chỉ cho RDP đi qua Tailscale (100.64.0.0/10), chặn mạng ngoài
           Get-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue |
             Disable-NetFirewallRule -ErrorAction SilentlyContinue
-
           Remove-NetFirewallRule -DisplayName "RDP Tailscale TCP" -ErrorAction SilentlyContinue
           Remove-NetFirewallRule -DisplayName "RDP Tailscale UDP" -ErrorAction SilentlyContinue
           New-NetFirewallRule -DisplayName "RDP Tailscale TCP" -Direction Inbound `
@@ -144,8 +142,7 @@ jobs:
           $ok = $false
           for ($i = 0; $i -lt 60; $i++) {
             if (Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue) {
-              $ok = $true
-              break
+              $ok = $true; break
             }
             Start-Sleep -Seconds 1
           }
@@ -160,10 +157,8 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $false
-          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
-            throw "Thiếu secret TAILSCALE_AUTHKEY."
-          }
           $ProgressPreference = "SilentlyContinue"
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) { throw "Thiếu secret TAILSCALE_AUTHKEY." }
 
           function Get-File([string]$Url, [string]$Out) {
             $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
@@ -179,13 +174,16 @@ jobs:
 
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
           if (-not (Test-Path $ts)) {
-            if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") {
-              $msi = "$env:TEMP\tailscale-setup-arm64.msi"
-              $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-arm64.msi"
+            $osArch = (Get-CimInstance Win32_OperatingSystem).OSArchitecture
+            if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64" -or $osArch -match "ARM") {
+              $arch = "arm64"
             } else {
-              $msi = "$env:TEMP\tailscale-setup-amd64.msi"
-              $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+              $arch = "amd64"
             }
+            $msi = "$env:TEMP\tailscale-setup-$arch.msi"
+            $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-$arch.msi"
+            Write-Host "Tải Tailscale ($arch)..."
+
             $ok = $false
             for ($i = 0; $i -lt 3; $i++) {
               try {
@@ -201,9 +199,7 @@ jobs:
             $p = Start-Process -FilePath "msiexec.exe" `
               -ArgumentList "/i `"$msi`" /qn /norestart TS_NOLAUNCH=true TS_UNATTENDEDMODE=true" `
               -PassThru -Wait
-            if ($p.ExitCode -notin @(0, 3010, 1641)) {
-              throw "Cài Tailscale lỗi (exit $($p.ExitCode))."
-            }
+            if ($p.ExitCode -notin @(0, 3010, 1641)) { throw "Cài Tailscale lỗi (exit $($p.ExitCode))." }
           } else {
             Write-Host "Tailscale đã cài sẵn."
           }
@@ -222,9 +218,7 @@ jobs:
             Start-Sleep -Seconds 5
           }
           $svc = Get-Service -Name $svc.Name -ErrorAction SilentlyContinue
-          if (-not $svc -or $svc.Status -ne "Running") {
-            throw "Service Tailscale không chạy."
-          }
+          if (-not $svc -or $svc.Status -ne "Running") { throw "Service Tailscale không chạy." }
 
           Start-Sleep -Seconds 5
           $up = $false
@@ -265,7 +259,7 @@ jobs:
 
           $discord = "$env:LOCALAPPDATA\Discord\Update.exe"
           if (Test-Path $discord) {
-            Write-Host "Discord đã cài sẵn: $discord"
+            Write-Host "Discord đã cài sẵn."
             Add-Content -Path $env:GITHUB_ENV -Value "DISCORD_STATUS=OK"
             return
           }
@@ -296,13 +290,10 @@ jobs:
           }
           if (-not $ok) { throw "Tải Discord thất bại." }
 
-          Get-Process -Name "Discord" -ErrorAction SilentlyContinue |
-            Stop-Process -Force -ErrorAction SilentlyContinue
+          Get-Process -Name "Discord" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           $p = Start-Process -FilePath $out -ArgumentList "-s" -PassThru
           if (-not $p.WaitForExit(300000)) { throw "Discord installer quá thời gian." }
-          if ($p.ExitCode -notin @(0, 3010, 1641)) {
-            Write-Warning "Discord installer exit code $($p.ExitCode)."
-          }
+          if ($p.ExitCode -notin @(0, 3010, 1641)) { Write-Warning "Discord installer exit code $($p.ExitCode)." }
 
           for ($i = 0; $i -lt 30; $i++) {
             if (Test-Path $discord) { break }
@@ -315,31 +306,46 @@ jobs:
           }
           if (-not (Test-Path $discord)) { throw "Discord cài thất bại." }
           Add-Content -Path $env:GITHUB_ENV -Value "DISCORD_STATUS=OK"
-          Write-Host "Discord OK: $discord"
+          Write-Host "Discord OK."
 
-      - name: 5. Tối ưu
+      - name: 5. Tối ưu hiệu năng
         shell: pwsh
         continue-on-error: true
         run: |
+          $ErrorActionPreference = "Continue"
           tzutil /s "SE Asia Standard Time"
           powercfg /hibernate off
           powercfg /setactive SCHEME_MIN
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change standby-timeout-ac 0
 
+          # Giảm hiệu ứng giao diện để RDP mượt hơn
           $vfx = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects"
           New-Item -Path $vfx -Force | Out-Null
-          Set-ItemProperty -Path $vfx -Name "VisualFXSetting" -Value 2 -Type DWord -ErrorAction SilentlyContinue
-          Set-ItemProperty "HKCU:\Control Panel\Desktop" -Name "DragFullWindows" -Value "0" -ErrorAction SilentlyContinue
-          Set-ItemProperty "HKCU:\Control Panel\Desktop\WindowMetrics" -Name "MinAnimate" -Value "0" -ErrorAction SilentlyContinue
+          Set-ItemProperty $vfx -Name "VisualFXSetting" -Value 2 -Type DWord
+          Set-ItemProperty "HKCU:\Control Panel\Desktop" -Name "DragFullWindows" -Value "0"
+          Set-ItemProperty "HKCU:\Control Panel\Desktop\WindowMetrics" -Name "MinAnimate" -Value "0"
           Set-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" `
-            -Name "EnableTransparency" -Value 0 -Type DWord -ErrorAction SilentlyContinue
+            -Name "EnableTransparency" -Value 0 -Type DWord
 
+          # Tắt service nền không cần
           foreach ($s in @("SysMain", "WSearch", "DiagTrack")) {
             Stop-Service $s -Force -ErrorAction SilentlyContinue
             Set-Service $s -StartupType Disabled -ErrorAction SilentlyContinue
           }
+
+          # Tắt quét Defender thời gian thực (đỡ tốn CPU, máy dùng xong bỏ)
+          try { Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction Stop } catch {
+            Write-Warning "Không tắt được Defender: $($_.Exception.Message)"
+          }
+
           netsh int tcp set global autotuninglevel=normal | Out-Null
 
-      - name: 6. Thông tin
+          # Dọn temp cho rộng ổ đĩa (chỉ 14 GB)
+          Remove-Item "$env:TEMP\*" -Recurse -Force -ErrorAction SilentlyContinue
+          Get-PSDrive C | ForEach-Object { Write-Host ("Ổ C còn trống: {0} GB" -f [math]::Round($_.Free / 1GB, 1)) }
+
+      - name: 6. Thông tin kết nối
         shell: pwsh
         run: |
           $ip = $env:TS_IP
@@ -354,9 +360,11 @@ jobs:
 
           $discordStatus = $env:DISCORD_STATUS
           if (-not $discordStatus) { $discordStatus = "xem log step 4" }
+          $os = (Get-CimInstance Win32_OperatingSystem).Caption
 
           $text = @(
             "## RDP sẵn sàng",
+            "- Windows: $os",
             "- Runner: ${{ inputs.runner }}",
             "- Host: $ip",
             "- Port: 3389",
@@ -376,6 +384,15 @@ jobs:
           Write-Host "RDP sống đến $($end.ToString('HH:mm:ss'))."
           while ((Get-Date) -lt $end) {
             Start-Sleep -Seconds 60
+            # Tự phục hồi nếu RDP/Tailscale bị tắt
+            try {
+              if (-not (Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue)) {
+                Write-Warning "RDP rớt, khởi động lại TermService..."
+                Restart-Service TermService -Force -ErrorAction SilentlyContinue
+              }
+              $t = Get-Service | Where-Object { $_.Name -match 'Tailscale' } | Select-Object -First 1
+              if ($t -and $t.Status -ne "Running") { Start-Service $t.Name -ErrorAction SilentlyContinue }
+            } catch { }
           }
 
       - name: 8. Debug khi lỗi
